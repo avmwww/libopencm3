@@ -164,6 +164,7 @@ struct usb_msc_trans {
 	uint8_t msd_buf[512];
 
 	bool csw_valid;
+	bool in_phase_zero_pad;
 	uint8_t csw_sent;		/* Write until 13 bytes */
 	union {
 		struct usb_msc_csw csw;
@@ -361,6 +362,43 @@ static void scsi_read_capacity(usbd_mass_storage *ms,
 	}
 }
 
+static void scsi_read_format_capacities(usbd_mass_storage *ms,
+					struct usb_msc_trans *trans,
+					enum trans_event event)
+{
+	uint8_t *buf;
+	uint32_t alloc_len;
+	uint32_t nblocks;
+	uint16_t resp_len;
+
+	if (EVENT_CBW_VALID != event)
+		return;
+
+	buf = get_cbw_buf(trans);
+	alloc_len = ((uint32_t)buf[6] << 16) | ((uint32_t)buf[7] << 8) | (uint32_t)buf[8];
+	nblocks = ms->block_count + 1U;
+	resp_len = 16;
+
+	memset(trans->msd_buf, 0, 16);
+	trans->msd_buf[3] = 8;
+	trans->msd_buf[8] = (nblocks >> 24) & 0xff;
+	trans->msd_buf[9] = (nblocks >> 16) & 0xff;
+	trans->msd_buf[10] = (nblocks >> 8) & 0xff;
+	trans->msd_buf[11] = nblocks & 0xff;
+	trans->msd_buf[12] = 0x02; /* formatted media */
+	trans->msd_buf[13] = 0;
+	trans->msd_buf[14] = 2; /* block length 512, BE24 */
+	trans->msd_buf[15] = 0;
+
+	if (alloc_len < resp_len)
+		resp_len = (uint16_t)alloc_len;
+
+	trans->bytes_to_write = resp_len;
+	trans->csw.csw.dCSWDataResidue =
+		trans->cbw.cbw.dCBWDataTransferLength - trans->bytes_to_write;
+	set_sbc_status_good(ms);
+}
+
 static void scsi_format_unit(usbd_mass_storage *ms,
 			     struct usb_msc_trans *trans,
 			     enum trans_event event)
@@ -420,7 +458,9 @@ static void scsi_mode_sense_6(usbd_mass_storage *ms,
 			trans->msd_buf[0] = 3;	/* Num bytes that follow */
 			trans->msd_buf[1] = 0;	/* Medium Type */
 			trans->msd_buf[2] = 0;	/* Device specific param */
-			trans->csw.csw.dCSWDataResidue = 4;
+			trans->csw.csw.dCSWDataResidue =
+				trans->cbw.cbw.dCBWDataTransferLength -
+				trans->bytes_to_write;
 #if 0
 		} else if (0x01 == page_code) {	/* Error recovery */
 		} else if (0x3F == page_code) {	/* All */
@@ -471,8 +511,37 @@ static void scsi_inquiry(usbd_mass_storage *ms,
 
 			set_sbc_status_good(ms);
 		} else {
-			/* TODO: Add VPD 0x83 support */
-			/* TODO: Add VPD 0x00 support */
+			uint8_t page = buf[2];
+			uint8_t alloc = buf[4];
+			uint16_t resp_len;
+
+			if (page == 0x80) {
+				/* Unit Serial Number VPD */
+				trans->msd_buf[0] = 0x00;
+				trans->msd_buf[1] = 0x80;
+				trans->msd_buf[2] = 0x00;
+				trans->msd_buf[3] = 0x00;
+				resp_len = 4;
+				trans->bytes_to_write = MIN((uint16_t)alloc, resp_len);
+				set_sbc_status_good(ms);
+			} else if (page == 0x00) {
+				/* Supported VPD pages */
+				trans->msd_buf[0] = 0x00;
+				trans->msd_buf[1] = 0x00;
+				trans->msd_buf[2] = 0x00;
+				trans->msd_buf[3] = 2;
+				trans->msd_buf[4] = 0x00;
+				trans->msd_buf[5] = 0x80;
+				resp_len = 6;
+				trans->bytes_to_write = MIN((uint16_t)alloc, resp_len);
+				set_sbc_status_good(ms);
+			} else {
+				set_sbc_status(ms, SBC_SENSE_KEY_ILLEGAL_REQUEST,
+					       SBC_ASC_INVALID_FIELD_IN_CDB,
+					       SBC_ASCQ_NA);
+				trans->csw.csw.bCSWStatus = CSW_STATUS_FAILED;
+				trans->bytes_to_write = 0;
+			}
 		}
 	}
 }
@@ -492,8 +561,10 @@ static void scsi_command(usbd_mass_storage *ms,
 		trans->bytes_to_write = 0;
 		trans->bytes_to_read = 0;
 		trans->byte_count = 0;
+		trans->in_phase_zero_pad = false;
 	}
 
+	trans->bytes_to_write = 0;
 	switch (trans->cbw.cbw.CBWCB[0]) {
 	case SCSI_TEST_UNIT_READY:
 	case SCSI_SEND_DIAGNOSTIC:
@@ -518,6 +589,9 @@ static void scsi_command(usbd_mass_storage *ms,
 	case SCSI_READ_CAPACITY:
 		scsi_read_capacity(ms, trans, event);
 		break;
+	case SCSI_READ_FORMAT_CAPACITIES:
+		scsi_read_format_capacities(ms, trans, event);
+		break;
 	case SCSI_READ_10:
 		scsi_read_10(ms, trans, event);
 		break;
@@ -537,6 +611,28 @@ static void scsi_command(usbd_mass_storage *ms,
 		trans->csw.csw.bCSWStatus = CSW_STATUS_FAILED;
 		break;
 	}
+}
+
+static void msc_fixup_bot_in_phase(struct usb_msc_trans *trans)
+{
+	if ((trans->cbw.cbw.bmCBWFlags & 0x80U) == 0U)
+		return;
+
+	if (trans->cbw.cbw.dCBWDataTransferLength == 0U)
+		return;
+
+	if (trans->bytes_to_read != 0U)
+		return;
+
+	if (trans->bytes_to_write != 0U)
+		return;
+
+	if (trans->csw.csw.bCSWStatus != CSW_STATUS_FAILED)
+		return;
+
+	trans->bytes_to_write = trans->cbw.cbw.dCBWDataTransferLength;
+	trans->in_phase_zero_pad = true;
+	trans->csw.csw.dCSWDataResidue = 0;
 }
 
 /*-- USB Mass Storage Layer --------------------------------------------------*/
@@ -562,6 +658,7 @@ static void msc_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
 
 		if (sizeof(struct usb_msc_cbw) == trans->cbw_cnt) {
 			scsi_command(ms, trans, EVENT_CBW_VALID);
+			msc_fixup_bot_in_phase(trans);
 			if (trans->byte_count < trans->bytes_to_read) {
 				/* We must wait until there is something to
 				 * read again. */
@@ -630,7 +727,12 @@ static void msc_data_rx_cb(usbd_device *usbd_dev, uint8_t ep)
 
 		left = trans->bytes_to_write - trans->byte_count;
 		max_len = MIN(ms->ep_out_size, left);
-		p = &trans->msd_buf[0x1ff & trans->byte_count];
+		if (trans->in_phase_zero_pad) {
+			memset(trans->msd_buf, 0, max_len);
+			p = trans->msd_buf;
+		} else {
+			p = &trans->msd_buf[0x1ff & trans->byte_count];
+		}
 		len = usbd_ep_write_packet(usbd_dev, ms->ep_in, p, max_len);
 		trans->byte_count += len;
 	} else {
@@ -693,7 +795,12 @@ static void msc_data_tx_cb(usbd_device *usbd_dev, uint8_t ep)
 
 		left = trans->bytes_to_write - trans->byte_count;
 		max_len = MIN(ms->ep_out_size, left);
-		p = &trans->msd_buf[0x1ff & trans->byte_count];
+		if (trans->in_phase_zero_pad) {
+			memset(trans->msd_buf, 0, max_len);
+			p = trans->msd_buf;
+		} else {
+			p = &trans->msd_buf[0x1ff & trans->byte_count];
+		}
 		len = usbd_ep_write_packet(usbd_dev, ep, p, max_len);
 		trans->byte_count += len;
 	} else {
@@ -727,6 +834,7 @@ static void msc_data_tx_cb(usbd_device *usbd_dev, uint8_t ep)
 			trans->byte_count = 0;
 			trans->csw_sent = 0;
 			trans->csw_valid = false;
+			trans->in_phase_zero_pad = false;
 		}
 	}
 }
@@ -834,6 +942,7 @@ usbd_mass_storage *usb_msc_init(usbd_device *usbd_dev,
 	_mass_storage.trans.byte_count = 0;
 	_mass_storage.trans.csw_valid = false;
 	_mass_storage.trans.csw_sent = 0;
+	_mass_storage.trans.in_phase_zero_pad = false;
 
 	set_sbc_status_good(&_mass_storage);
 
