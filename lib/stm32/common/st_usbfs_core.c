@@ -236,6 +236,10 @@ void st_usbfs_poll(usbd_device *dev)
 {
 	uint16_t istr = *USB_ISTR_REG;
 
+	if (istr & USB_ISTR_ERR) {
+		USB_CLR_ISTR_ERR();
+	}
+
 	if (istr & USB_ISTR_RESET) {
 		USB_CLR_ISTR_RESET();
 		dev->pm_top = USBD_PM_TOP;
